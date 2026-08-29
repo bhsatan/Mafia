@@ -19,6 +19,21 @@ const playerGuild = new Map(); // userId -> guildId
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Like sleep(), but /mafia skip can resolve it early by calling game.discussionSkipResolver().
+function waitForDiscussion(ms, game) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      game.discussionSkipResolver = null;
+      resolve();
+    }, ms);
+    game.discussionSkipResolver = () => {
+      clearTimeout(timer);
+      game.discussionSkipResolver = null;
+      resolve();
+    };
+  });
+}
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
@@ -94,6 +109,29 @@ async function handleCommand(interaction) {
     manager.delete(interaction.guildId);
     return interaction.reply('🛑 Game ended by host.');
   }
+
+  if (sub === 'skip') {
+    if (interaction.user.id !== game.hostId) {
+      return interaction.reply({ content: 'Only the host can skip discussion.', ephemeral: true });
+    }
+    if (typeof game.discussionSkipResolver === 'function') {
+      game.discussionSkipResolver();
+      return interaction.reply('⏭️ Discussion skipped — moving straight to the vote.');
+    }
+    return interaction.reply({ content: "There's no discussion in progress to skip right now.", ephemeral: true });
+  }
+
+  if (sub === 'transfer') {
+    if (interaction.user.id !== game.hostId) {
+      return interaction.reply({ content: 'Only the current host can transfer host control.', ephemeral: true });
+    }
+    const target = interaction.options.getUser('target');
+    if (!game.players.has(target.id)) {
+      return interaction.reply({ content: 'That person needs to be in the lobby/game first.', ephemeral: true });
+    }
+    game.hostId = target.id;
+    return interaction.reply(`👑 <@${target.id}> is now the host and controls \`start\`, \`end\`, \`skip\`, and \`transfer\`.`);
+  }
 }
 
 async function sendRoleDMs(game) {
@@ -144,7 +182,7 @@ async function runGameLoop(game) {
         .map((p) => p.username)
         .join(', ')}`
     );
-    await sleep(DAY_DISCUSSION_MS);
+    await waitForDiscussion(DAY_DISCUSSION_MS, game);
 
     // ---------------- DAY: vote ----------------
     const rows = buildTargetSelectRows(`day_vote:${game.guildId}`, 'Vote to eliminate', game.alivePlayers(), true);

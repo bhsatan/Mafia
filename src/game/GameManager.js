@@ -18,6 +18,7 @@ class Game {
     this.nightActions = { mafiaVotes: new Map(), doctorSave: null, detectiveCheck: null };
     this.dayVotes = new Map(); // voterId -> targetId
     this.log = [];
+    this.discussionSkipResolver = null; // set while discussion is running, so /mafia skip can end it early
   }
 
   addPlayer(id, username) {

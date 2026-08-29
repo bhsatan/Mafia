@@ -11,7 +11,16 @@ const commands = [
     .addSubcommand((sub) =>
       sub.setName('start').setDescription('Start the game (host only, needs at least 4 players)')
     )
-    .addSubcommand((sub) => sub.setName('end').setDescription('End the current game (host only)')),
+    .addSubcommand((sub) => sub.setName('end').setDescription('End the current game (host only)'))
+    .addSubcommand((sub) =>
+      sub.setName('skip').setDescription('Host only: skip ahead to voting immediately during discussion')
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('transfer')
+        .setDescription('Host only: hand host control to another player')
+        .addUserOption((opt) => opt.setName('target').setDescription('Who should become host').setRequired(true))
+    ),
 ].map((c) => c.toJSON());
 
 module.exports = { commands };
