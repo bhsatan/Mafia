@@ -3,7 +3,9 @@ const { ROLES, assignRoles, shuffle } = require('./roles');
 const PHASE = {
   LOBBY: 'lobby',
   NIGHT: 'night',
-  DAY: 'day',
+  AWAITING_DISCUSSION: 'awaiting_discussion', // night resolved, waiting for host to open discussion
+  DISCUSSION: 'discussion', // host has the floor open, ends when host runs /mafia openvote
+  VOTING: 'voting',
   ENDED: 'ended',
 };
 
@@ -11,18 +13,21 @@ class Game {
   constructor(guildId, channelId, hostId) {
     this.guildId = guildId;
     this.channelId = channelId;
-    this.hostId = hostId;
+    this.hostId = hostId; // the host is NOT a player - they oversee only
     this.phase = PHASE.LOBBY;
     this.dayNumber = 0;
     this.players = new Map(); // userId -> { id, username, role, alive }
-    this.nightActions = { mafiaVotes: new Map(), doctorSave: null, detectiveCheck: null };
+    this.nightActions = { mafiaVotes: new Map(), doctorSave: null };
     this.dayVotes = new Map(); // voterId -> targetId
     this.log = [];
-    this.discussionSkipResolver = null; // set while discussion is running, so /mafia skip can end it early
+    // Resolver functions set while the game loop is waiting on a host command.
+    this.discussStartResolver = null;
+    this.discussEndResolver = null;
   }
 
   addPlayer(id, username) {
     if (this.phase !== PHASE.LOBBY) throw new Error('Game already started.');
+    if (id === this.hostId) throw new Error('The host oversees the game and does not play as a character.');
     if (this.players.size >= 50) throw new Error('Lobby is full (max 50 players).');
     if (this.players.has(id)) throw new Error('You already joined.');
     this.players.set(id, { id, username, role: null, alive: true });
@@ -41,10 +46,11 @@ class Game {
     return this.alivePlayers().filter((p) => p.role === role);
   }
 
-  start() {
+  /** Host chooses exactly how many Mafia and Doctors there are; everyone else becomes a Citizen. */
+  start(mafiaCount, doctorCount) {
     if (this.phase !== PHASE.LOBBY) throw new Error('Game already started.');
     const ids = [...this.players.keys()];
-    const assignment = assignRoles(ids);
+    const assignment = assignRoles(ids, mafiaCount, doctorCount);
     for (const [id, role] of assignment.entries()) {
       this.players.get(id).role = role;
     }
@@ -60,10 +66,6 @@ class Game {
 
   recordDoctorSave(targetId) {
     this.nightActions.doctorSave = targetId;
-  }
-
-  recordDetectiveCheck(targetId) {
-    this.nightActions.detectiveCheck = targetId;
   }
 
   /** Tally mafia votes (majority, random tiebreak), apply doctor save, kill if unsaved. */
@@ -86,18 +88,26 @@ class Game {
       if (killedPlayer) killedPlayer.alive = false;
     }
 
-    const investigateResult = this.nightActions.detectiveCheck
-      ? {
-          targetId: this.nightActions.detectiveCheck,
-          isMafia: this.players.get(this.nightActions.detectiveCheck)?.role === ROLES.MAFIA,
-        }
-      : null;
-
     this.log.push({ day: this.dayNumber, type: 'night', killedId: saved ? null : killedId, saved });
-    this.nightActions = { mafiaVotes: new Map(), doctorSave: null, detectiveCheck: null };
-    this.phase = PHASE.DAY;
+    this.nightActions = { mafiaVotes: new Map(), doctorSave: null };
+    this.phase = PHASE.AWAITING_DISCUSSION;
 
-    return { killedPlayer: saved ? null : killedPlayer, saved: Boolean(saved && killedId), investigateResult };
+    return { killedPlayer: saved ? null : killedPlayer, saved: Boolean(saved && killedId) };
+  }
+
+  // ---- Host-controlled discussion gate ----
+  openDiscussion() {
+    if (this.phase !== PHASE.AWAITING_DISCUSSION) {
+      throw new Error(`Can't open discussion right now (current phase: ${this.phase}).`);
+    }
+    this.phase = PHASE.DISCUSSION;
+  }
+
+  openVoting() {
+    if (this.phase !== PHASE.DISCUSSION) {
+      throw new Error(`Can't open voting right now (current phase: ${this.phase}).`);
+    }
+    this.phase = PHASE.VOTING;
   }
 
   // ---- Day phase ----

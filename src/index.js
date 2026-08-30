@@ -3,32 +3,28 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const { GameManager, PHASE, ROLES } = require('./game/GameManager');
 const { buildTargetSelectRows } = require('./game/selectMenus');
 
-// ---- Tunable timers (ms). Adjust to taste. ----
-const NIGHT_ACTION_MS = 45_000;
-const DAY_DISCUSSION_MS = 90_000;
-const DAY_VOTE_MS = 45_000;
+// ---- Tunable timers (ms). Discussion length is host-controlled, not timed. ----
+const NIGHT_ACTION_MS = 90_000;
+const DAY_VOTE_MS = 60_000;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
 const manager = new GameManager();
-// Tracks which guild's game a user is currently part of, so we can route
-// DM-based night-action interactions (DMs have no guildId of their own).
+// Tracks which guild's game a player is part of, so DM-based night-action
+// interactions (DMs have no guildId of their own) can be routed correctly.
 const playerGuild = new Map(); // userId -> guildId
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Like sleep(), but /mafia skip can resolve it early by calling game.discussionSkipResolver().
-function waitForDiscussion(ms, game) {
+// Generic gate: the game loop calls this and awaits it; a host command later
+// resolves it by calling game[resolverProp](), letting the host fully control
+// when discussion opens and when it ends.
+function waitForHostSignal(game, resolverProp) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      game.discussionSkipResolver = null;
-      resolve();
-    }, ms);
-    game.discussionSkipResolver = () => {
-      clearTimeout(timer);
-      game.discussionSkipResolver = null;
+    game[resolverProp] = () => {
+      game[resolverProp] = null;
       resolve();
     };
   });
@@ -56,10 +52,8 @@ async function handleCommand(interaction) {
 
   if (sub === 'create') {
     const game = manager.create(interaction.guildId, interaction.channelId, interaction.user.id);
-    game.addPlayer(interaction.user.id, interaction.user.username);
-    playerGuild.set(interaction.user.id, interaction.guildId);
     return interaction.reply(
-      `🎭 Mafia lobby created by <@${interaction.user.id}>! Use \`/mafia join\` to hop in (max 50 players). Host runs \`/mafia start\` when ready.`
+      `🎭 Mafia lobby created! <@${interaction.user.id}> is the **host** (overseeing only, not playing). Players use \`/mafia join\` to hop in (max 50). Host runs \`/mafia start mafia:<n> doctor:<n>\` when ready.`
     );
   }
 
@@ -81,24 +75,45 @@ async function handleCommand(interaction) {
 
   if (sub === 'players') {
     const names = [...game.players.values()].map((p) => p.username).join(', ') || 'nobody yet';
-    return interaction.reply(`Lobby (${game.players.size}/50): ${names}`);
+    return interaction.reply(`Lobby (${game.players.size}/50): ${names}. Host: <@${game.hostId}>`);
   }
 
   if (sub === 'start') {
     if (interaction.user.id !== game.hostId) {
       return interaction.reply({ content: 'Only the host who created the lobby can start it.', ephemeral: true });
     }
-    if (game.players.size < 4) {
-      return interaction.reply({ content: 'Need at least 4 players to start.', ephemeral: true });
-    }
-    game.start();
-    const mafiaCount = game.aliveByRole(ROLES.MAFIA).length;
+    const mafiaCount = interaction.options.getInteger('mafia');
+    const doctorCount = interaction.options.getInteger('doctor') ?? 0;
+    game.start(mafiaCount, doctorCount); // throws with a clear message if counts don't fit
+    const citizenCount = game.players.size - mafiaCount - doctorCount;
     await interaction.reply(
-      `🌙 The game begins! ${game.players.size} players, ${mafiaCount} of them are Mafia. Check your DMs for your role.`
+      `🌙 The game begins! ${game.players.size} players — ${mafiaCount} Mafia, ${doctorCount} Doctor(s), ${citizenCount} Citizen(s). Check your DMs for your role.`
     );
     await sendRoleDMs(game);
     runGameLoop(game).catch((e) => console.error('Game loop crashed:', e));
     return;
+  }
+
+  if (sub === 'discuss') {
+    if (interaction.user.id !== game.hostId) {
+      return interaction.reply({ content: 'Only the host can open discussion.', ephemeral: true });
+    }
+    if (typeof game.discussStartResolver !== 'function') {
+      return interaction.reply({ content: `Can't open discussion right now (current phase: ${game.phase}).`, ephemeral: true });
+    }
+    game.discussStartResolver();
+    return interaction.reply('💬 Discussion is now open.');
+  }
+
+  if (sub === 'openvote') {
+    if (interaction.user.id !== game.hostId) {
+      return interaction.reply({ content: 'Only the host can open voting.', ephemeral: true });
+    }
+    if (typeof game.discussEndResolver !== 'function') {
+      return interaction.reply({ content: `Can't open voting right now (current phase: ${game.phase}).`, ephemeral: true });
+    }
+    game.discussEndResolver();
+    return interaction.reply('🗳️ Discussion closed — voting is opening now.');
   }
 
   if (sub === 'end') {
@@ -110,27 +125,19 @@ async function handleCommand(interaction) {
     return interaction.reply('🛑 Game ended by host.');
   }
 
-  if (sub === 'skip') {
-    if (interaction.user.id !== game.hostId) {
-      return interaction.reply({ content: 'Only the host can skip discussion.', ephemeral: true });
-    }
-    if (typeof game.discussionSkipResolver === 'function') {
-      game.discussionSkipResolver();
-      return interaction.reply('⏭️ Discussion skipped — moving straight to the vote.');
-    }
-    return interaction.reply({ content: "There's no discussion in progress to skip right now.", ephemeral: true });
-  }
-
   if (sub === 'transfer') {
     if (interaction.user.id !== game.hostId) {
       return interaction.reply({ content: 'Only the current host can transfer host control.', ephemeral: true });
     }
     const target = interaction.options.getUser('target');
-    if (!game.players.has(target.id)) {
-      return interaction.reply({ content: 'That person needs to be in the lobby/game first.', ephemeral: true });
-    }
+    const targetIsPlayer = game.players.has(target.id);
     game.hostId = target.id;
-    return interaction.reply(`👑 <@${target.id}> is now the host and controls \`start\`, \`end\`, \`skip\`, and \`transfer\`.`);
+    const note = targetIsPlayer
+      ? " Heads up: they're also currently a player in this game — the host role doesn't remove them from play automatically."
+      : '';
+    return interaction.reply(
+      `👑 <@${target.id}> is now the host and controls \`start\`, \`discuss\`, \`openvote\`, \`end\`, and \`transfer\`.${note}`
+    );
   }
 }
 
@@ -143,12 +150,10 @@ async function sendRoleDMs(game) {
           ? 'Work with your fellow Mafia at night to eliminate the town. Try not to get caught.'
           : player.role === ROLES.DOCTOR
           ? 'Each night, pick one player to save from elimination.'
-          : player.role === ROLES.DETECTIVE
-          ? "Each night, investigate one player to learn if they're Mafia."
           : 'Survive, and use the day discussion to help vote out the Mafia.';
       await user.send(`🎭 Your role is **${player.role}**.\n${flavor}`);
     } catch {
-      // User has DMs closed - the game channel will note this.
+      // User has DMs closed - they simply won't receive night prompts.
     }
   }
 }
@@ -162,29 +167,29 @@ async function runGameLoop(game) {
     await sendNightPrompts(game);
     await sleep(NIGHT_ACTION_MS);
 
-    const nightResult = game.resolveNight();
+    const nightResult = game.resolveNight(); // phase -> AWAITING_DISCUSSION
     if (nightResult.killedPlayer) {
-      await channel.send(`☠️ **${nightResult.killedPlayer.username}** was found dead this morning. They were a **${nightResult.killedPlayer.role}**.`);
+      await channel.send(
+        `☠️ **${nightResult.killedPlayer.username}** was found dead this morning. They were a **${nightResult.killedPlayer.role}**.`
+      );
     } else {
       await channel.send('☀️ Everyone survived the night!');
-    }
-    if (nightResult.investigateResult) {
-      await notifyDetective(game, nightResult.investigateResult);
     }
 
     let winner = game.checkWinCondition();
     if (winner) return announceWinner(channel, game, winner);
 
-    // ---------------- DAY: discussion ----------------
+    // ---------------- Host-controlled discussion ----------------
+    await channel.send(`⏸️ Host, run \`/mafia discuss\` whenever you'd like to open the floor for discussion.`);
+    await waitForHostSignal(game, 'discussStartResolver');
+    game.openDiscussion();
     await channel.send(
-      `💬 **Discussion time!** You have ${DAY_DISCUSSION_MS / 1000}s to talk it over. Alive: ${game
-        .alivePlayers()
-        .map((p) => p.username)
-        .join(', ')}`
+      `💬 **Discussion is open.** Alive: ${game.alivePlayers().map((p) => p.username).join(', ')}\nHost can run \`/mafia openvote\` any time to move to voting.`
     );
-    await waitForDiscussion(DAY_DISCUSSION_MS, game);
 
-    // ---------------- DAY: vote ----------------
+    await waitForHostSignal(game, 'discussEndResolver');
+    game.openVoting();
+
     const rows = buildTargetSelectRows(`day_vote:${game.guildId}`, 'Vote to eliminate', game.alivePlayers(), true);
     await channel.send({
       content: `🗳️ **Voting is open for ${DAY_VOTE_MS / 1000}s!** Everyone alive, pick who to eliminate (or skip).`,
@@ -192,7 +197,7 @@ async function runGameLoop(game) {
     });
     await sleep(DAY_VOTE_MS);
 
-    const dayResult = game.resolveDay();
+    const dayResult = game.resolveDay(); // phase -> NIGHT, dayNumber++
     if (dayResult.tied) {
       await channel.send('⚖️ The vote was tied — no one is eliminated today.');
     } else if (dayResult.eliminatedPlayer) {
@@ -212,7 +217,6 @@ async function sendNightPrompts(game) {
   const alive = game.alivePlayers();
   const mafia = game.aliveByRole(ROLES.MAFIA);
   const doctors = game.aliveByRole(ROLES.DOCTOR);
-  const detectives = game.aliveByRole(ROLES.DETECTIVE);
 
   for (const m of mafia) {
     const targets = alive.filter((p) => p.role !== ROLES.MAFIA);
@@ -220,14 +224,6 @@ async function sendNightPrompts(game) {
   }
   for (const d of doctors) {
     await dmWithRows(d.id, `💉 Choose someone to save tonight:`, buildTargetSelectRows(`night_doctor:${game.guildId}`, 'Choose who to save', alive));
-  }
-  for (const d of detectives) {
-    const targets = alive.filter((p) => p.id !== d.id);
-    await dmWithRows(
-      d.id,
-      `🔍 Choose someone to investigate:`,
-      buildTargetSelectRows(`night_detective:${game.guildId}:${d.id}`, 'Choose who to investigate', targets)
-    );
   }
 }
 
@@ -237,21 +233,6 @@ async function dmWithRows(userId, content, rows) {
     await user.send({ content, components: rows });
   } catch {
     // DMs closed - action simply won't be recorded for this player.
-  }
-}
-
-async function notifyDetective(game, result) {
-  // Find the detective who most recently submitted a check (stored on the game instance).
-  const detectiveId = game.lastDetectiveId;
-  if (!detectiveId) return;
-  try {
-    const user = await client.users.fetch(detectiveId);
-    const target = game.players.get(result.targetId);
-    await user.send(
-      `🔍 Investigation result: **${target?.username ?? 'Unknown'}** is ${result.isMafia ? 'MAFIA 🚨' : 'not Mafia ✅'}.`
-    );
-  } catch {
-    // DMs closed
   }
 }
 
@@ -267,7 +248,7 @@ async function announceWinner(channel, game, winner) {
 }
 
 async function handleSelectMenu(interaction) {
-  const [type, guildId, extra] = interaction.customId.split(':');
+  const [type, guildId] = interaction.customId.split(':');
   const game = manager.get(guildId);
   if (!game || game.phase === PHASE.ENDED) {
     return interaction.reply({ content: 'This game has already ended.', ephemeral: true });
@@ -286,15 +267,8 @@ async function handleSelectMenu(interaction) {
     return interaction.reply({ content: '💉 Save recorded.', ephemeral: true });
   }
 
-  if (type === 'night_detective') {
-    if (game.phase !== PHASE.NIGHT) return interaction.reply({ content: 'Not the night phase anymore.', ephemeral: true });
-    game.recordDetectiveCheck(value);
-    game.lastDetectiveId = extra; // the detective's own userId, embedded in the customId
-    return interaction.reply({ content: '🔍 Investigation recorded.', ephemeral: true });
-  }
-
   if (type === 'day_vote') {
-    if (game.phase !== PHASE.DAY) return interaction.reply({ content: 'Voting is closed.', ephemeral: true });
+    if (game.phase !== PHASE.VOTING) return interaction.reply({ content: 'Voting is closed.', ephemeral: true });
     game.recordDayVote(interaction.user.id, value);
     return interaction.reply({ content: '🗳️ Vote recorded.', ephemeral: true });
   }

@@ -1,42 +1,42 @@
-// Role identities used by the game.
+// Role identities used by the game. Detective was removed per host-controlled
+// design: the host explicitly sets Mafia and Doctor counts, everyone else is
+// a Citizen.
 const ROLES = {
   MAFIA: 'Mafia',
   DOCTOR: 'Doctor',
-  DETECTIVE: 'Detective',
-  VILLAGER: 'Villager',
+  CITIZEN: 'Citizen',
 };
 
 /**
- * Build a role list for the given number of players.
- * Scales team sizes so large games (up to 50 players) stay balanced:
- * - Mafia is roughly 20% of players (min 1)
- * - 1 Doctor per 8 players (min 1 if 5+ players)
- * - 1 Detective per 8 players (min 1 if 5+ players)
- * - Everyone else is a Villager
+ * Build a role list from host-chosen counts.
+ * @param {number} playerCount
+ * @param {number} mafiaCount
+ * @param {number} doctorCount
  */
-function buildRoleList(playerCount) {
-  if (playerCount < 4) {
-    throw new Error('Mafia requires at least 4 players.');
+function buildRoleList(playerCount, mafiaCount, doctorCount) {
+  if (playerCount < 3) {
+    throw new Error('Need at least 3 players to start.');
   }
   if (playerCount > 50) {
     throw new Error('This bot supports a maximum of 50 players.');
   }
+  if (!Number.isInteger(mafiaCount) || mafiaCount < 1) {
+    throw new Error('Mafia count must be a whole number of at least 1.');
+  }
+  if (!Number.isInteger(doctorCount) || doctorCount < 0) {
+    throw new Error('Doctor count must be a whole number of 0 or more.');
+  }
+  if (mafiaCount + doctorCount >= playerCount) {
+    throw new Error('Mafia + Doctor counts must leave at least 1 player as a Citizen.');
+  }
 
-  const mafiaCount = Math.max(1, Math.round(playerCount * 0.2));
-  const doctorCount = playerCount >= 5 ? Math.max(1, Math.floor(playerCount / 8)) : 0;
-  const detectiveCount = playerCount >= 5 ? Math.max(1, Math.floor(playerCount / 8)) : 0;
+  const citizenCount = playerCount - mafiaCount - doctorCount;
 
-  const specialCount = mafiaCount + doctorCount + detectiveCount;
-  const villagerCount = Math.max(0, playerCount - specialCount);
-
-  const roles = [
+  return [
     ...Array(mafiaCount).fill(ROLES.MAFIA),
     ...Array(doctorCount).fill(ROLES.DOCTOR),
-    ...Array(detectiveCount).fill(ROLES.DETECTIVE),
-    ...Array(villagerCount).fill(ROLES.VILLAGER),
+    ...Array(citizenCount).fill(ROLES.CITIZEN),
   ];
-
-  return roles;
 }
 
 // Fisher-Yates shuffle
@@ -50,12 +50,14 @@ function shuffle(array) {
 }
 
 /**
- * Assigns a shuffled role to each player ID.
+ * Assigns a shuffled role to each player ID, using host-chosen Mafia/Doctor counts.
  * @param {string[]} playerIds
+ * @param {number} mafiaCount
+ * @param {number} doctorCount
  * @returns {Map<string,string>} playerId -> role
  */
-function assignRoles(playerIds) {
-  const roles = shuffle(buildRoleList(playerIds.length));
+function assignRoles(playerIds, mafiaCount, doctorCount) {
+  const roles = shuffle(buildRoleList(playerIds.length, mafiaCount, doctorCount));
   const shuffledPlayers = shuffle(playerIds);
   const assignment = new Map();
   shuffledPlayers.forEach((id, i) => assignment.set(id, roles[i]));
